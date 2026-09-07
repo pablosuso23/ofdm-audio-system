@@ -862,7 +862,8 @@ if __name__ == "__main__":
             FACTOR_SOBREMUESTREO = 9
             N_BITS_RAFAGA_CORTA = 300
             NUM_REPETICIONES = 10
-            GAP_ENTRE_RAFAGAS_S = 0.08  # 80 ms de silencio entre ráfagas consecutivas
+            GAP_ENTRE_RAFAGAS_S = 0.5  # AUMENTADO de 0.08 a 0.5s, prueba diagnóstica: ¿necesita
+            # el hardware más tiempo de recuperación entre ráfagas para no alternar niveles?
 
             ofdm_audio = OFDMSystem(N=N, CP_len=CP_LEN, bits_per_symbol=BITS_PER_SYMBOL,
                                      N_datos=N_DATOS, semilla=123)
@@ -904,6 +905,13 @@ if __name__ == "__main__":
                   f"de {N_BITS_RAFAGA_CORTA} bits ({duracion_total_s:.2f} s totales, "
                   f"{margen_latencia_s:.1f} s de silencio en cada extremo, "
                   f"{GAP_ENTRE_RAFAGAS_S*1000:.0f} ms entre ráfagas)...")
+
+            # Forzar WASAPI en modo exclusivo (Sabrent: micrófono=14, altavoz=13) para
+            # saltarse el pipeline de audio compartido de Windows (resampleo, "modos de
+            # procesamiento" que no se pueden desactivar del todo desde el panel).
+            sd.default.device = (14, 13)
+            sd.default.extra_settings = sd.WasapiSettings(exclusive=True)
+
             grabacion = ofdm_audio.reproducir_y_grabar(senal_con_margen, fs_audio=FS_AUDIO)
 
             resultados_rafagas = ofdm_audio.procesar_multiples_rafagas(
@@ -933,6 +941,54 @@ if __name__ == "__main__":
             ofdm_audio.guardar_resultados_csv(resultados_rafagas, ruta_csv="resultados_paso5.csv")
             print("\n[Paso 5] Resultados añadidos a 'resultados_paso5.csv' "
                   "(columnas: Repeticion, Pico, Fase_CPE_grados, Errores_bits, BER).")
+
+            # ------------------------------------------------------------------
+            # EXTRA: guardar artefactos de audio REAL para las figuras de
+            # validación pedidas por el tutor (curva de correlación sobre
+            # grabación real, espectro de la señal pasobanda, constelación de
+            # una ráfaga real). No cambia nada del resultado ya calculado,
+            # solo guarda datos intermedios que ya se calculan por dentro.
+            # ------------------------------------------------------------------
+            # 1) La grabación real completa, en .wav (para poder reproducirla
+            #    o inspeccionarla luego, y para poder recalcular todo esto
+            #    sin necesidad de repetir la prueba con hardware).
+            grabacion_norm = grabacion / (np.max(np.abs(grabacion)) + 1e-12) * 0.9
+            wavfile.write("grabacion_real.wav", FS_AUDIO, (grabacion_norm * 32767).astype(np.int16))
+
+            # 2) Curva de correlación del sincronizador SOBRE LA GRABACIÓN REAL
+            #    (no sobre datos simulados) -> prueba visual de que el
+            #    sincronizador funciona con audio real, no solo en simulación.
+            senal_bb_real = ofdm_audio.demodular_pasobanda(
+                grabacion, fc=FC, fs_audio=FS_AUDIO, factor_sobremuestreo=FACTOR_SOBREMUESTREO
+            )
+            _, _, correlacion_real = ofdm_audio.sincronizar(senal_bb_real)
+            np.save("correlacion_real.npy", correlacion_real)
+
+            # 3) Espectro (densidad espectral de potencia) de la señal
+            #    pasobanda REALMENTE transmitida, para comprobar visualmente
+            #    que la energía cae dentro de la banda 3-7 kHz indicada.
+            frecuencias_psd, psd = signal.welch(senal_pasobanda_una_rafaga, fs=FS_AUDIO, nperseg=1024)
+            np.savez("espectro_pasobanda.npz", frecuencias=frecuencias_psd, psd=psd)
+
+            # 4) Constelación recuperada de la PRIMERA ráfaga real detectada
+            #    (no de simulación), recalculando el mismo procesamiento que
+            #    procesar_multiples_rafagas hace por dentro, para poder
+            #    quedarnos con los símbolos y no solo con el BER agregado.
+            inicios_datos_real, inicios_preambulo_real, _ = ofdm_audio.sincronizar_multiples(
+                senal_bb_real, NUM_REPETICIONES, separacion_minima_muestras=longitud_rafaga_muestras_bb
+            )
+            if inicios_datos_real:
+                fase0 = ofdm_audio.estimar_cpe_preambulo(senal_bb_real, inicios_preambulo_real[0])
+                bloques0 = ofdm_audio.remover_prefijo_ciclico(
+                    senal_bb_real, inicios_datos_real[0], num_bloques_audio
+                )
+                espectro_cpe0 = ofdm_audio.corregir_cpe(np.fft.fft(bloques0, axis=1), fase0)
+                canal0 = ofdm_audio.estimar_canal_pilotos(espectro_cpe0) * np.exp(1j * fase0)
+                simbolos_reales = ofdm_audio.demodular_ofdm(bloques0, canal_estimado=canal0)
+                np.save("constelacion_real.npy", simbolos_reales)
+
+            print("[Extra] Artefactos de validación guardados: grabacion_real.wav, "
+                  "correlacion_real.npy, espectro_pasobanda.npz, constelacion_real.npy")
 
             if resultados_rafagas:
                 bers = [r["ber"] for r in resultados_rafagas]
